@@ -794,9 +794,9 @@ flowchart TD
         const ZOOM_STEP = 0.15;
 
         // ═══════════════════════════════════════════════
-        // Init
+        // Config & Init
         // ═══════════════════════════════════════════════
-        mermaid.initialize({
+        const BASE_CONFIG = {
             startOnLoad: false,
             theme: 'dark',
             securityLevel: 'loose',
@@ -812,16 +812,67 @@ flowchart TD
             pie: { useMaxWidth: false },
             gitGraph: { useMaxWidth: false },
             mindmap: { useMaxWidth: false }
-        });
+        };
 
+        mermaid.initialize(BASE_CONFIG);
         document.getElementById('mermaidVersion').textContent = mermaid.version || '11+';
 
         // ═══════════════════════════════════════════════
         // Rendering
         // ═══════════════════════════════════════════════
+        function preprocessCode(raw) {
+            // Extract %%{init: ...}%% directives and merge into config
+            const initRegex = /%%\{init:\s*([\s\S]*?)\}%%/gi;
+            let merged = {};
+            let clean = raw;
+            let match;
+
+            while ((match = initRegex.exec(raw)) !== null) {
+                try {
+                    const parsed = JSON.parse(`{${match[1]}}`);
+                    merged = deepMerge(merged, parsed);
+                } catch {
+                    // Try wrapping the whole match as JSON
+                    try {
+                        const parsed = JSON.parse(match[1]);
+                        merged = deepMerge(merged, parsed);
+                    } catch { /* skip unparseable directives */ }
+                }
+                clean = clean.replace(match[0], '');
+            }
+
+            // Re-initialize mermaid with merged config if directives were found
+            if (Object.keys(merged).length > 0) {
+                const finalConfig = deepMerge(deepMerge({}, BASE_CONFIG), merged);
+                // Ensure useMaxWidth stays false
+                for (const key of ['flowchart','sequence','gantt','journey','er','pie','gitGraph','mindmap']) {
+                    if (finalConfig[key]) finalConfig[key].useMaxWidth = false;
+                    else finalConfig[key] = { useMaxWidth: false };
+                }
+                mermaid.initialize(finalConfig);
+            } else {
+                mermaid.initialize(BASE_CONFIG);
+            }
+
+            return clean.trim();
+        }
+
+        function deepMerge(target, source) {
+            const result = { ...target };
+            for (const key of Object.keys(source)) {
+                if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])
+                    && target[key] && typeof target[key] === 'object') {
+                    result[key] = deepMerge(target[key], source[key]);
+                } else {
+                    result[key] = source[key];
+                }
+            }
+            return result;
+        }
+
         async function renderDiagram() {
-            const code = document.getElementById('code-editor').value.trim();
-            if (!code) return;
+            const rawCode = document.getElementById('code-editor').value.trim();
+            if (!rawCode) return;
 
             const errorPanel = document.getElementById('errorPanel');
             const output = document.getElementById('diagram-output');
@@ -833,6 +884,7 @@ flowchart TD
             statusText.textContent = 'Rendering...';
 
             try {
+                const code = preprocessCode(rawCode);
                 renderCounter++;
                 const id = `mermaid-diagram-${renderCounter}`;
 
