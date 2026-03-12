@@ -1,0 +1,399 @@
+%%{init: {"flowchart": {"htmlLabels": true, "curve": "basis"}, "theme": "dark"}}%%
+flowchart TD
+
+    %% =========================================================================
+    %% EXTERNAL ENTRY POINTS
+    %% =========================================================================
+
+    subgraph ENTRY["Entry Points"]
+        direction LR
+        CLI_GEN[/"npm run generate\npipeline/generate.ts"/]
+        CLI_RENDER[/"npm run render\npipeline/render.ts"/]
+        SCRIPT_REAL[/"npx tsx scripts/real-render.ts\ndirect Gemini + mock TTS"/]
+        SCRIPT_TEST[/"npx tsx scripts/test-render.ts\ndry-run, no API keys"/]
+        BATCH_SH[/"scripts/batch-render.sh\nbatch job submission"/]
+    end
+
+    %% =========================================================================
+    %% CONFIGURATION LAYER
+    %% =========================================================================
+
+    subgraph CONFIG["Configuration — src/config/default.ts"]
+        direction TB
+        PC["PipelineConfig\n---\nLLMProviderConfig\nprovider: gemini or openai or anthropic or vertex\nmodel: gemini-3.1-flash-lite-preview\napiKey: GOOGLE_API_KEY\nmaxTokens: 8192, temp: 0.7\ngcpProjectId, gcpRegion\n---\nNeo4jConfig\nuri: bolt://neo4j.ailatests.com:7687\nuser, password, database\n---\nTTSConfig\nprovider: openai or google\nvoice: nova, format: mp3, speed: 1.0\noutputDir: output/audio\npublicPath: /audio\n---\nRenderConfig\nwidth: 1920, height: 1080, fps: 30\nbackgroundColor: #2c3e2c\n---\nSceneDefaults\nbackground: #2c3e2c\nfontFamily, textColor, accentColor"]
+        ENV_VARS["Environment Variables\nGOOGLE_API_KEY, OPENAI_API_KEY\nNEO4J_URI / USER / PASSWORD / DATABASE\nGCP_PROJECT_ID / GCP_REGION\nGCS_BUCKET, TTS_PROVIDER / TTS_VOICE"]
+        LOAD_CFG["loadConfig(overrides?)\napplies env var overrides\nplus manual overrides"]
+        ENV_VARS --> LOAD_CFG --> PC
+    end
+
+    %% =========================================================================
+    %% LLM PROVIDER ABSTRACTION
+    %% =========================================================================
+
+    subgraph LLM_LAYER["LLM Provider Abstraction — src/models/"]
+        direction TB
+        LLM_FACTORY["createLLMProvider(config)\nfactory.ts\nroutes to Gemini / OpenAI / Anthropic"]
+        LLM_IFACE["LLMProvider interface\n---\ngenerateText(prompt)\ngenerateJSON(prompt, zodSchema)\nchat(messages[])\nchatJSON(messages[], zodSchema)"]
+        GEMINI["GeminiProvider — gemini.ts\nat-google-slash-generative-ai SDK\nprovider=gemini: direct API\nprovider=vertex: Vertex AI\nuses withRetry and parseAndValidate"]
+        OPENAI_LLM["OpenAIProvider — openai.ts\nopenai SDK\ngpt-4o default"]
+        ANTHROPIC["AnthropicProvider — anthropic.ts\ndynamic import, SDK optional\nclaude models"]
+        LLM_UTILS["utils.ts\nwithRetry(fn, maxAttempts)\nextractJSON(raw)\nparseAndValidate(json, schema)\nlogLLMCall(metrics)"]
+        LLM_FACTORY --> GEMINI & OPENAI_LLM & ANTHROPIC
+        GEMINI & OPENAI_LLM & ANTHROPIC --> LLM_IFACE
+        LLM_UTILS -.->|used by| GEMINI & OPENAI_LLM & ANTHROPIC
+    end
+
+    %% =========================================================================
+    %% DATA SOURCE — NEO4J
+    %% =========================================================================
+
+    subgraph NEO4J_LAYER["Data Source — src/neo4j/"]
+        direction TB
+        NEO4J_DB[("Neo4j Graph Database\nbolt://neo4j.ailatests.com:7687\n---\n8 Databases:\nmathgrade3, mathgrade6, mathgrade9\nsciencegrade4, sciencegrade6, sciencegrade9\nreadinggrade3, readinggrade6")]
+        NEO4J_CLIENT["Neo4jClient — client.ts\nSingleton via getNeo4jClient()\nconnect() / disconnect()\ngetSession(database, mode)\nrunInSession(db, callback)\nquery(db, cypher, params)"]
+        NEO4J_QUERIES["queries.ts\nfetchLessons(client, db, chapterId)\nfetchRLOs(client, db, lessonId)\nfetchAUs(client, db, rloId)\nfetchLessonHierarchy() — 2-pass\nfetchLessonHierarchyOptimized() — 1-pass\ninspectSchema()"]
+        NEO4J_TYPES["Neo4j Type Hierarchy — types.ts\n---\nSubject: id, name, grade\n  Unit: id, title, order\n    Chapter: id, title, order\n      Lesson: id, title, order\n        RLO: id, title, learningOutcome\n             bloomsLevel, keyTerms\n          AU: id, type, content\n              problem, solution, steps\n              options, correctOptionIndex\nAUType: explanation / example / non_example\n        practice / assessment / visual\n        mnemonic / summary"]
+        NEO4J_DB --> NEO4J_CLIENT --> NEO4J_QUERIES
+        NEO4J_QUERIES --> NEO4J_TYPES
+    end
+
+    %% =========================================================================
+    %% PIPELINE ORCHESTRATOR
+    %% =========================================================================
+
+    subgraph PIPELINE["Pipeline Orchestration — src/pipeline/"]
+        direction TB
+
+        ORCH["PipelineOrchestrator — orchestrator.ts\n---\nrun(input: PipelineInput)\nrunBatch(inputs[], concurrency=3)\nresume(lessonId, database)\non(listener: PipelineListener)\n---\nPipelineInput:\ndatabase: DatabaseName\nlessonId: string\nrloId?: string\nconfig?: PipelineConfigOverrides\n---\nPipelineOutput:\nlessonId, videoPath, audioFiles[]\nduration, storyboard, visualMapping\npipelineState"]
+
+        STATE_MGR["StateManager — state-manager.ts\n---\nPersistence root:\noutput/pipeline_state/{lessonId}/\n---\nsaveState / loadState\nsaveArtifact / loadArtifact\n---\nArtifacts saved per stage:\nhierarchy.json\nstoryboard.json\nstoryboard_judge_N.json\nstoryboard_revision_N.json\nvisual_mapping.json\nvisual_judge_N.json\nvisual_mapping_revision_N.json\ntts_results.json\nrender_context.json\nstate.json (stage pointer)"]
+
+        PIPELINE_STAGES["PipelineStage order:\nfetch → storyboard → storyboard_judge\n→ visual → visual_judge → tts\n→ render → complete or failed\nResumable: picks up from last stage"]
+
+        PIPELINE_EVENTS["PipelineEvent types:\nstage_start / stage_complete\nstage_error / retry / complete\nEmits typed events to listeners"]
+
+        LOGGER["PipelineLogger — logger.ts\nStructured logging\nFile + console output\nPer-lesson log files"]
+
+        BATCH_PROC["createBatchFromDatabase() — batch.ts\nQueries Neo4j for all lessons\nFilters by chapterId, lessonIds, limit\nReturns PipelineInput[] for runBatch()"]
+
+        ORCH --> STATE_MGR
+        ORCH --> PIPELINE_STAGES
+        ORCH --> PIPELINE_EVENTS
+        ORCH --> LOGGER
+        BATCH_PROC --> ORCH
+    end
+
+    %% =========================================================================
+    %% STAGE 1: FETCH
+    %% =========================================================================
+
+    subgraph STAGE1["Stage 1 — Fetch"]
+        S1_NODE["fetchLessonHierarchy(client, db, lessonId)\n---\nOutput: LessonHierarchy\nsubject, unit, chapter, lesson\nrlos[]: RLOWithAUs[]\neach rlo contains aus[]"]
+    end
+
+    %% =========================================================================
+    %% STAGE 2+3: STORYBOARD AGENT + JUDGE
+    %% =========================================================================
+
+    subgraph STAGE2["Stage 2 — Storyboard Generation"]
+        direction TB
+        SB_PROMPT["buildSystemPrompt(grade, subject)\nbuildUserPrompt(hierarchy)\nPrompt includes grade, subject,\nall RLOs and AUs, scene type rules,\nnarration/duration constraints"]
+        SB_GEN["llm.chatJSON(messages, StoryboardSchema)\n---\nOutput: Storyboard\nlessonId, title, grade, subject\ntotalScenes (4-12), estimatedDuration\nscenes[]: StoryboardScene[]\n  sceneId: scene_NN_type\n  sceneType: intro/content/example/practice/summary\n  layoutType: text_only/text_visual/\n              text_visual_animation/visual_only/visual_animation\n  narration: max 75 words, min 10 chars\n  textContent[], visualHint (20+ words)\n  keyTerms[], estimatedDuration\n  auReferences[]"]
+        SB_VALIDATE["validateStoryboard() post-gen checks:\nAU coverage, narration word count 5-75\nvisual hint min 20 words\nduration consistency\nscene ID sequential format\nnon-empty textContent"]
+        SB_PROMPT --> SB_GEN --> SB_VALIDATE
+    end
+
+    subgraph STAGE3["Stage 3 — Storyboard Judge Loop"]
+        direction TB
+        SB_JUDGE["judgeStoryboard()\n---\nDeterministic checks:\nAU Coverage (weight 0.20)\nVisual Hint Specificity (0.15)\nScene Balance 5-30s (0.10)\nPedagogical Structure (0.15)\nNarration word count\n---\nLLM-based evaluation:\nNarration Quality (0.20)\nText Content Quality (0.10)\nEngagement (0.10)\n---\nPassingScore: 70/100\nCritical: AU Coverage, Narration\nQuality, Visual Hint, Pedagogy"]
+        SB_JUDGE_RESULT{"JudgeResult\npassed: bool\nscore: 0-100\nrevisionRequests[]"}
+        SB_REVISE["reviseStoryboard(storyboard, revisionRequests, llm)\nbuildRevisionPrompt()\nllm.generateJSON(StoryboardSchema)"]
+        SB_JUDGE --> SB_JUDGE_RESULT
+        SB_JUDGE_RESULT -->|"FAIL score less than 70\nattempt <= 2"| SB_REVISE
+        SB_REVISE -->|revised storyboard| SB_JUDGE
+        SB_JUDGE_RESULT -->|"PASS or retries exhausted"| STAGE2_OUT
+        STAGE2_OUT(["Approved Storyboard\nJSON artifact saved to disk"])
+    end
+
+    %% =========================================================================
+    %% STAGE 4+5: VISUAL AGENT + JUDGE
+    %% =========================================================================
+
+    subgraph STAGE4["Stage 4 — Visual Mapping (per-scene loop)"]
+        direction TB
+        VA_LOOP["For each StoryboardScene\nprocessed one at a time\nUp to MAX_RETRIES=2 per scene"]
+        VA_PROMPT["buildScenePrompt(sbScene, storyboard, index, total)\n---\nSYSTEM_PROMPT includes:\nCanvas 1920x1080 center-origin\nNamed REGIONS:\n  TITLE: y [-450,-380] full width\n  BOOK_TEXT_PANEL: x [-960,-50] y [-350,450]\n  BOOK_VISUAL_PANEL: x [50,960] y [-350,450]\n  STEP_INDICATOR: y [400,500]\n  FOOTER: y [450,540]\nPALETTE: chalkboard colors\nElement types and animation types\nLayout guidelines and spatial rules"]
+        VA_LLM["llm.chat(messages, {temp:0.7, responseFormat:json})\nRaw LLM JSON output string"]
+        NORMALIZE["normalizeRawScene() — normalize.ts\n---\n1. Propagate parent region to\n   children missing region\n2. Expand array timeline targets\n   into separate timeline blocks\n3. Map aliases:\n   Fade and FadeInUp to FadeIn"]
+        ZOD_VALIDATE["VisualSceneSchema.safeParse()\n---\nStructural checks:\nsceneId, sceneType, narration, audioKey\nelements[]: VisualElementSchema\n  id, type: Rect/Circle/Txt/Line/Polygon/Latex/Img/Node\n  props: Record string unknown\n  region: TITLE/BOOK_TEXT_PANEL/etc (required top-level)\n  children?: ChildVisualElementSchema (region optional)\ntimeline[]: TimelineBlockSchema\n  target: coerce array to first element\n  action: FadeIn/FadeOut/Create/Write/GrowFromCenter/\n          DrawBorderThenFill/GrowArrow/MoveBy/ScaleTo/\n          ColorChange/LaggedStart\n  startTime >= 0, duration > 0"]
+        SEM_VALIDATE["validateMapping() semantic checks:\nUnique element IDs per scene\nTimeline targets reference valid IDs\nPositions within canvas bounds\nNo overlapping sibling bboxes\nNo forbidden colors: transparent/#2c3e2c/#000000\nRichness: >= 8 elements, >= 5 timeline blocks\n         >= 3 animation types"]
+
+        VA_LOOP --> VA_PROMPT --> VA_LLM --> NORMALIZE --> ZOD_VALIDATE
+        ZOD_VALIDATE -->|"FAIL: zod schema errors"| VA_REFINE
+        ZOD_VALIDATE -->|PASS| SEM_VALIDATE
+        SEM_VALIDATE -->|"FAIL: semantic errors\nattempt <= 2"| VA_REFINE
+        VA_REFINE["buildRefinementPrompt(lastRaw, issues)\nlower temp to 0.5\nappend error details to chat history"]
+        VA_REFINE --> VA_LLM
+    end
+
+    subgraph SPATIAL["Spatial Overlap Resolver — src/agents/visual/spatial.ts"]
+        direction TB
+        SPATIAL_ENTRY["resolveSceneOverlaps(scene: VisualScene)\n---\nReturns SpatialResolutionResult:\nscene: corrected VisualScene\nstate: SceneState\n  overlapsDetected[], overlapsResolved count\n  warnings[]\nmodified: boolean\nWrapped in try/catch — falls back to\noriginal scene if spatial throws"]
+        BBOX["computeElementBBox(element)\nPer-type bounding boxes:\nTxt: char-width * fontSize estimate\nRect: width x height\nCircle: radius * 2 each side\nOther: width|100 x height|100\n---\nresolveAllElements(elements)\nRecursive bbox computation\nNode = union of children bboxes"]
+        OVERLAP_DETECT["detectOverlaps(resolved, region)\nAABB separating-axis test\ndoBBoxesOverlap(a, b, padding)\nThreshold: overlap area > 10 percent of smaller\nChecks sibling pairs only at top level"]
+        OVERLAP_RESOLVE["resolveOverlaps(scene, overlaps)\nStrategies: shift-down, shift-right,\nshift-left, resize, reposition\nResolution padding: 20px\nMax iterations: 5 for convergence\nReal data results: 53 detected,\n27 resolved (48% reduction)"]
+        SPATIAL_ENTRY --> BBOX --> OVERLAP_DETECT --> OVERLAP_RESOLVE
+    end
+
+    subgraph STAGE4_OUT["Visual Scene Output"]
+        VA_SCENE_DONE(["VisualScene per scene\nspatial-corrected\nJSON assembled into VisualMapping"])
+    end
+
+    subgraph STAGE5["Stage 5 — Visual Judge Loop"]
+        direction TB
+        VJ_VALIDATE["validateMapping() + judgeVisualMapping()\n---\nAll semantic validation checks plus:\nCompleteness: every storyboard scene\n  has a corresponding visual scene\nRegion bounds: element positions within\n  assigned region x/y constraints\nChildren usage: only Rect/Circle/\n  Polygon/Node may have children\nNarration match: visual narration\n  must match storyboard narration\nPer-scene scoring: start 100,\n  minus 15 per error, minus 3 per warning\n  plus bonus for richness above threshold"]
+        VJ_RESULT{"errors.length == 0?"}
+        VJ_REFINE["Per-scene refinement for scenes with errors:\nbuildRefinementPrompt(scene, errors)\nllm.chatJSON(VisualSceneSchema)\ntemp=0.5 for precision"]
+        VJ_VALIDATE --> VJ_RESULT
+        VJ_RESULT -->|"FAIL errors > 0\nattempt <= 2"| VJ_REFINE
+        VJ_REFINE --> VJ_VALIDATE
+        VJ_RESULT -->|"PASS or retries exhausted"| STAGE5_OUT
+        STAGE5_OUT(["Approved VisualMapping\nlessonId + scenes[]: VisualScene[]\nJSON artifact saved to disk"])
+    end
+
+    %% =========================================================================
+    %% STAGE 6: TTS
+    %% =========================================================================
+
+    subgraph STAGE6["Stage 6 — TTS Audio Generation"]
+        direction TB
+        TTS_SERVICE["generateAudio(scenes, ttsConfig) — tts/service.ts\nBatch size: 5 scenes in parallel\nMax retries: 3 per scene\nExponential backoff: 1s, 2s, 4s\nRetries on: 429, 500, 502, 503\neconnreset, timeout, overloaded"]
+        TTS_CACHE["File cache check:\nSkip synthesis if\noutput/audio/{audioKey}.mp3 exists\nCopy to public/audio if missing there"]
+        TTS_FACTORY["TTS Provider factory:\nopenai -> OpenAITTSProvider (tts-1, nova voice)\ngoogle -> GoogleTTSProvider (stub, not implemented)"]
+        TTS_SYNTH["provider.synthesize(text, {voice, format, speed})\nReturns Buffer of raw audio bytes"]
+        AUDIO_SAVE["Save audio to two locations:\noutput/audio/{audioKey}.mp3 (persistent storage)\npublic/audio/{audioKey}.mp3 (Vite serving during render)"]
+        DURATION["getAudioDuration() — duration.ts\n1. ffprobe (accurate if installed)\n   ffprobe -v quiet -show_entries format=duration\n2. Word-count fallback:\n   wordCount / (150 wpm * speed)"]
+        TTS_RESULT_NODE["TTSResult[]\naudioKey, filePath\npublicPath: /audio/{audioKey}.mp3\ndurationSeconds\ntext (original narration)"]
+        TTS_SERVICE --> TTS_CACHE
+        TTS_CACHE -->|cache miss| TTS_FACTORY --> TTS_SYNTH --> AUDIO_SAVE --> DURATION --> TTS_RESULT_NODE
+        TTS_CACHE -->|cache hit| DURATION
+    end
+
+    %% =========================================================================
+    %% STAGE 7: RENDER
+    %% =========================================================================
+
+    subgraph STAGE7["Stage 7 — Render"]
+        direction TB
+
+        subgraph CODE_GEN["Code Generation — src/renderers/"]
+            direction TB
+            INTERP["interpretScene(scene, context) — interpreter.ts\nOR generateSceneCode(scene, audioPath, dur) — code-generator.ts\n---\nPer scene generates complete .tsx file:\n1. createRef<T>() for all elements including nested children\n2. JSX layout tree with all elements at opacity 0\n3. Audio component with narration mp3 src\n4. Animation timeline code grouped by startTime\n5. waitFor(max(0, narrationDuration - timelineDuration) + 1.5s)"]
+            PROP_FIXES["Prop normalization applied:\ncornerRadius -> radius\nstrokeWidth -> lineWidth\nfontWeight 'bold' -> 700\nLine x1/y1/x2/y2 -> points array\nCircle radius -> size times 2\nForbidden colors stripped (transparent etc)"]
+            ANIM_CODE["Animation code generators per action:\nFadeIn: ref.opacity(1, dur)\nWrite: ref.text(text, dur) typewriter\nGrowFromCenter: ref.scale(0 to 1)\nCreate: all(opacity, scale)\nDrawBorderThenFill: lineWidth then fill\nMoveBy: all(x+dx, y+dy) -- BUG when dx=dy=0\nScaleTo: ref.scale(targetScale)\nColorChange: ref.fill(color)\nGrowArrow: ref.end(0 to 1)\nLaggedStart: loop children opacity\nConcurrent blocks wrapped in all(...)"]
+        end
+
+        subgraph PROJ_GEN["Project Generation — src/renderers/project-generator.ts"]
+            direction TB
+            GEN_SCENES["generateSceneFiles(scenes, context)\nproduces {sceneId.tsx: code} map"]
+            GEN_PROJECT["generateProjectTsx(scenes, config)\nproduces project.tsx with:\nmakeProject() with all scenes imported\nbackground: #2c3e2c\nsize: 1920x1080, fps: 30"]
+            GEN_RENDER_TS["generateRenderTs()\nproduces render.ts\nPuppeteer/ffmpeg driver script"]
+            GEN_PKG["generatePackageJson()\nproduces package.json with:\nat-revideo-slash-2d, at-revideo-slash-core\nat-revideo-slash-renderer, vite, tsx, typescript"]
+            GEN_CFG["generateTsconfig() + generateViteConfig()\nproduces tsconfig.json (JSX react-jsx, ES2022)\nproduces vite.config.ts (Revideo Vite plugin)"]
+            PROJ_FILES["ProjectFiles output:\nprojectTsx, renderTs\nscenes: map of filename to code\npackageJson, tsconfigJson, viteConfig"]
+            GEN_SCENES & GEN_PROJECT & GEN_RENDER_TS & GEN_PKG & GEN_CFG --> PROJ_FILES
+        end
+
+        subgraph SCAFFOLD["Scaffolding — src/renderers/scaffold.ts"]
+            direction TB
+            SCAFFOLD_OP["scaffoldRenderProject(lessonId, files, config)\n---\nCreates directory structure:\noutput/{lessonId}/\n  project.tsx\n  render.ts\n  vite.config.ts\n  package.json\n  tsconfig.json\n  src/{sceneId}.tsx for each scene\n  public/audio/{audioKey}.mp3\n  output/output.mp4 (created by renderer)"]
+            NPM_INSTALL["npm install runs automatically\ninstalls all Revideo dependencies"]
+            SCAFFOLD_OP --> NPM_INSTALL
+        end
+
+        REVIDEO_RENDER["Revideo Render Execution:\ncd output/{lessonId} && npm run render\n---\nVite + Revideo plugin\nesbuild compiles .tsx files\nPuppeteer drives headless browser\nffmpeg encodes animation frames\nOutputs: output/output.mp4\n1920x1080 at 30fps"]
+
+        CODE_GEN --> PROJ_GEN --> SCAFFOLD --> REVIDEO_RENDER
+    end
+
+    %% =========================================================================
+    %% OUTPUT
+    %% =========================================================================
+
+    subgraph OUTPUT_LAYER["Final Output"]
+        direction TB
+        MP4["output/{lessonId}/output/output.mp4\n---\n1920x1080 at 30fps\nChalkboard background #2c3e2c\nWith TTS narration audio\nEducational scene animations\nReal result: 1:49, 5.8MB"]
+        GCS_UPLOAD["GCS: gs://nafes-viewer/videos/{lessonId}.mp4\nuploaded by Cloud Run worker"]
+        MP4 --> GCS_UPLOAD
+    end
+
+    %% =========================================================================
+    %% GCP INFRASTRUCTURE
+    %% =========================================================================
+
+    subgraph GCP["GCP Infrastructure — infrastructure/"]
+        direction TB
+
+        subgraph TERRAFORM["Terraform — infrastructure/terraform/"]
+            direction TB
+            CR_JOB["Cloud Run Jobs\naila-video-renderer\nRuns worker.js container\nNode + Chromium + ffmpeg image\nTriggered via Pub/Sub subscription\nProject: gen-lang-client-0995380229\nRegion: us-central1"]
+            PUBSUB["Pub/Sub\nvideo-render-jobs (main topic)\nvideo-render-jobs-sub (subscription)\naila-video-dlq (dead letter topic)\nDLQ retains messages 7 days\nMessage: jobId, lessonId, database,\npipelineStatePath, audioPath"]
+            GCS_BUCKETS["GCS Buckets\nnafes-viewer: final videos (existing)\npipeline bucket: intermediate files\n  storyboards, visual mappings, audio\n  auto-delete after 30 days\nTerraform state: optional GCS backend"]
+            ARTIFACT_REG["Artifact Registry\naila-video-renderer repository\nDocker image storage\nKeeps 10 most recent versions"]
+            IAM["Service Accounts and IAM\naila-render-worker:\n  storage.objectAdmin\n  pubsub.subscriber\n  secretmanager.secretAccessor\naila-render-api:\n  pubsub.publisher\n  run.developer\n  storage.objectViewer"]
+            CLOUD_BUILD["cloudbuild.yaml\nCI/CD pipeline\nBuilds Docker image on push\nPushes to Artifact Registry"]
+        end
+
+        subgraph DOCKER["Docker Worker — infrastructure/docker/"]
+            direction TB
+            DOCKERFILE["Dockerfile\nBase: node:20-slim\nInstalls: Chromium, ffmpeg, tsx runtime\nEntrypoint: node worker.js"]
+            WORKER_JS["worker.js — Batch Rendering Worker\n---\nTwo modes:\npull: long-running, polls Pub/Sub\njob: Cloud Run Job, single run\n---\nFlow per render job:\n1. Pull message from Pub/Sub subscription\n2. Download pipeline state JSON from GCS\n3. Download audio MP3 files from GCS\n4. Execute: npm run render in project dir\n5. Upload output.mp4 to GCS bucket\n6. Acknowledge Pub/Sub message\n---\nConfig from environment:\nGCP_PROJECT_ID, GCS_BUCKET\nPUBSUB_SUBSCRIPTION\nMAX_CONCURRENT_RENDERS=1\nRENDER_TIMEOUT_MS=300000 (5 min)"]
+        end
+    end
+
+    %% =========================================================================
+    %% REVIDEO TEMPLATE REFERENCE
+    %% =========================================================================
+
+    subgraph TEMPLATE["Revideo Template — templates/"]
+        direction TB
+        BASE_SCENE["templates/src/base-scene.tsx\nReference scene pattern:\nmakeScene2D(name, function*(view))\ncreateRef<T>() for each element\nview.add(<Node>...JSX layout...)\nAudio component for narration\nyield* animations with waitFor\nDemonstrates children nesting"]
+        TEMPLATE_PKG["templates/package.json\nat-revideo-slash-2d, at-revideo-slash-core\nat-revideo-slash-renderer"]
+        TEMPLATE_VITE["templates/vite.config.ts\nRevideo Vite plugin config"]
+        TEMPLATE_TS["templates/tsconfig.json\nJSX: react-jsx\ntarget: ES2022"]
+    end
+
+    %% =========================================================================
+    %% TEST LAYER
+    %% =========================================================================
+
+    subgraph TESTS["Tests — test/ (317 passing + 31 skipped)"]
+        direction TB
+        UNIT_SPATIAL["test/unit/spatial.test.ts\n56 tests\nbbox computation, overlap detection\nresolution strategies, determinism"]
+        INT_PIPELINE["test/integration/pipeline-e2e.test.ts\n58 tests\nall 7 stages, full pipeline flow\nwith mock Neo4j and mock LLM"]
+        INT_SMOKE["test/integration/smoke.test.ts\n29 tests\nimports, config, types\nmock Neo4j connectivity"]
+        INT_SPATIAL["test/integration/spatial-integration.test.ts\n31 tests\nreal data A/B testing\ndeterminism, structure validation"]
+        FIXTURES["test/fixtures/\nsample-lessons.ts:\n  mathGrade3, scienceGrade6, readingGrade3\nmock-neo4j.ts:\n  drop-in mock for all query functions"]
+    end
+
+    %% =========================================================================
+    %% KNOWN BUGS / ACTIVE ISSUES
+    %% =========================================================================
+
+    subgraph BUGS["Active Issues (as of 2026-03-12)"]
+        direction TB
+        BUG1["BUG: MoveBy code-gen crash\nIn code-generator.ts animationToCode()\nEmits: all(, when dx=0 and dy=0\nCrashes esbuild during render\nAffects: scene_01_intro.tsx line 185\n         scene_02_content.tsx line 261\nFix: skip animation or emit no-op\n     when both deltas are zero"]
+        BUG2["ISSUE: real-render.ts bypasses spatial engine\nScript calls Gemini LLM directly\nNever calls resolveSceneOverlaps()\nSpatial engine only runs via\ngenerateVisualMapping() in agent.ts\nFix: call resolveSceneOverlaps()\n     after normalizeRawScene()"]
+        BUG3["STUB: Google TTS not implemented\ngoogle-tts.ts returns empty Buffer\nOpenAI TTS (nova voice) is the\nonly working TTS provider"]
+        BUG4["STUB: Anthropic provider uses dynamic import\nSDK not in package.json\nAnthropicProvider will fail at runtime\nunless sdk is manually installed"]
+    end
+
+    %% =========================================================================
+    %% DATA FLOW CONNECTIONS
+    %% =========================================================================
+
+    %% Entry points -> Orchestrator
+    CLI_GEN & CLI_RENDER & SCRIPT_REAL & BATCH_SH --> ORCH
+    SCRIPT_TEST -.->|"bypasses orchestrator\ncalls renderers directly"| SCAFFOLD_OP
+
+    %% Config wiring
+    PC --> ORCH
+    LOAD_CFG --> LLM_FACTORY
+
+    %% Orchestrator -> LLM Factory
+    ORCH -->|"createLLMProvider(config.llm)"| LLM_FACTORY
+
+    %% Stage 1: Fetch
+    ORCH -->|"Stage 1: fetch\nPipelineInput database + lessonId"| S1_NODE
+    NEO4J_CLIENT --> S1_NODE
+    NEO4J_QUERIES --> S1_NODE
+    S1_NODE -->|"LessonHierarchy\nsubject, unit, chapter\nlesson, rlos with aus"| STAGE2
+
+    %% Stage 2: Storyboard
+    LLM_IFACE -->|"chatJSON(messages, StoryboardSchema)"| SB_GEN
+    SB_VALIDATE -->|"Storyboard JSON"| STAGE3
+
+    %% Stage 3: Judge loop
+    SB_JUDGE -->|"score + revisionRequests"| SB_JUDGE_RESULT
+    STAGE2_OUT -->|"Approved Storyboard"| VA_LOOP
+
+    %% Stage 4: Visual (per scene)
+    LLM_IFACE -->|"chat(messages, json format)"| VA_LLM
+    SEM_VALIDATE -->|"PASS: valid VisualScene"| SPATIAL_ENTRY
+    OVERLAP_RESOLVE -->|"corrected VisualScene"| VA_SCENE_DONE
+    VA_SCENE_DONE --> STAGE5
+
+    %% Stage 5: Visual Judge loop
+    VJ_REFINE -->|"llm.chatJSON refinement"| LLM_IFACE
+    STAGE5_OUT -->|"VisualMapping\nlessonId + scenes array"| STAGE6
+
+    %% Stage 6: TTS
+    TTS_RESULT_NODE -->|"TTSResult[]\naudioKey, filePath, publicPath, durationSeconds"| STAGE7
+
+    %% Stage 7: Render
+    INTERP & ANIM_CODE & PROP_FIXES --> GEN_SCENES
+    REVIDEO_RENDER --> MP4
+
+    %% State persistence (dashed = non-blocking)
+    STATE_MGR -.->|"resumable state\nload on startup"| ORCH
+    S1_NODE -.->|"hierarchy.json saved"| STATE_MGR
+    STAGE2_OUT -.->|"storyboard.json saved"| STATE_MGR
+    STAGE5_OUT -.->|"visual_mapping.json saved"| STATE_MGR
+    TTS_RESULT_NODE -.->|"tts_results.json saved"| STATE_MGR
+    SCAFFOLD_OP -.->|"projectPath saved"| STATE_MGR
+
+    %% GCP infrastructure flow
+    REVIDEO_RENDER -->|"output.mp4"| GCS_UPLOAD
+    PUBSUB -->|"trigger execution"| CR_JOB
+    CR_JOB -->|"runs container"| WORKER_JS
+    WORKER_JS -->|"downloads state + audio"| GCS_BUCKETS
+    WORKER_JS -->|"uploads mp4"| GCS_BUCKETS
+    CLOUD_BUILD -->|"push Docker image"| ARTIFACT_REG
+    ARTIFACT_REG -->|"pull Docker image"| CR_JOB
+
+    %% Template reference
+    BASE_SCENE -.->|"reference pattern\nfor generated scenes"| INTERP
+
+    %% Bug annotations
+    ANIM_CODE -.->|"BUG: all( empty arg"| BUG1
+    SCRIPT_REAL -.->|"bypasses spatial"| BUG2
+    TTS_FACTORY -.->|"google is stub"| BUG3
+
+    %% =========================================================================
+    %% STYLING
+    %% =========================================================================
+
+    classDef dataSource fill:#1a4a6a,stroke:#4a9aca,color:#ffffff
+    classDef llmNode fill:#4a1a6a,stroke:#9a4aca,color:#ffffff
+    classDef agentNode fill:#1a4a1a,stroke:#4aca4a,color:#ffffff
+    classDef judgeNode fill:#4a3a1a,stroke:#caa04a,color:#ffffff
+    classDef ttsNode fill:#1a3a4a,stroke:#4a8aaa,color:#ffffff
+    classDef renderNode fill:#3a1a4a,stroke:#8a4aaa,color:#ffffff
+    classDef configNode fill:#2a2a2a,stroke:#6a6a6a,color:#cccccc
+    classDef outputNode fill:#1a4a1a,stroke:#4aca4a,color:#ffffff
+    classDef gcpNode fill:#1a3a3a,stroke:#4a9a9a,color:#ffffff
+    classDef bugNode fill:#6a1a1a,stroke:#ca4a4a,color:#ffaaaa
+    classDef infraNode fill:#2a3a1a,stroke:#6a8a4a,color:#ccffaa
+    classDef testNode fill:#2a2a3a,stroke:#6a6a9a,color:#ccccff
+    classDef entryNode fill:#3a2a1a,stroke:#8a6a4a,color:#ffddaa
+    classDef pipelineNode fill:#2a2a4a,stroke:#6a6aaa,color:#ddddff
+    classDef approvedNode fill:#1a5a1a,stroke:#5aca5a,color:#ffffff
+
+    class NEO4J_DB dataSource
+    class NEO4J_CLIENT,NEO4J_QUERIES,NEO4J_TYPES dataSource
+    class LLM_FACTORY,LLM_IFACE,GEMINI,OPENAI_LLM,ANTHROPIC,LLM_UTILS llmNode
+    class SB_PROMPT,SB_GEN,SB_VALIDATE,VA_LOOP,VA_PROMPT,VA_LLM,NORMALIZE,ZOD_VALIDATE,SEM_VALIDATE agentNode
+    class SB_JUDGE,SB_JUDGE_RESULT,SB_REVISE,VJ_VALIDATE,VJ_RESULT,VJ_REFINE judgeNode
+    class SPATIAL_ENTRY,BBOX,OVERLAP_DETECT,OVERLAP_RESOLVE agentNode
+    class TTS_SERVICE,TTS_CACHE,TTS_FACTORY,TTS_SYNTH,AUDIO_SAVE,DURATION,TTS_RESULT_NODE ttsNode
+    class INTERP,PROP_FIXES,ANIM_CODE,GEN_SCENES,GEN_PROJECT,GEN_RENDER_TS,GEN_PKG,GEN_CFG,PROJ_FILES,SCAFFOLD_OP,NPM_INSTALL,REVIDEO_RENDER renderNode
+    class PC,ENV_VARS,LOAD_CFG configNode
+    class MP4,GCS_UPLOAD outputNode
+    class CR_JOB,PUBSUB,GCS_BUCKETS,ARTIFACT_REG,IAM,CLOUD_BUILD gcpNode
+    class DOCKERFILE,WORKER_JS infraNode
+    class UNIT_SPATIAL,INT_PIPELINE,INT_SMOKE,INT_SPATIAL,FIXTURES testNode
+    class CLI_GEN,CLI_RENDER,SCRIPT_REAL,SCRIPT_TEST,BATCH_SH entryNode
+    class BUG1,BUG2,BUG3,BUG4 bugNode
+    class ORCH,STATE_MGR,PIPELINE_STAGES,PIPELINE_EVENTS,LOGGER,BATCH_PROC pipelineNode
+    class BASE_SCENE,TEMPLATE_PKG,TEMPLATE_VITE,TEMPLATE_TS renderNode
+    class STAGE2_OUT,VA_SCENE_DONE,STAGE5_OUT approvedNode
